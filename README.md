@@ -267,3 +267,66 @@ The Architectural Result
 
 With these policies active, the Flutter frontend becomes completely "dumb" regarding security. If a malicious user intercepts the API and tries to run SELECT * FROM vehicles, the PostgreSQL server will automatically restrict the response to only the vehicles matching their authenticated company_id.
 
+
+## 🌍 Part 5: The CO2 Emission Calculation Engine (Core Logic)
+
+### The Inefficiency of Client-Side Processing
+The core feature of EcoLogistics is aggregating a company's total carbon footprint. A common mistake in SaaS development is fetching raw data (thousands of individual trip logs) to the frontend application and running the math locally. This consumes massive amounts of bandwidth, slows down the dashboard, and drains client resources.
+
+Instead, the CO2 calculation engine is built directly into the PostgreSQL database using **Dynamic Views**. The server crunches the numbers, and the Flutter frontend simply fetches the final, aggregated results.
+
+### The Calculation Formula
+The math for Scope 1 emissions (direct fleet emissions) is straightforward: 
+`Distance Traveled (km) * Vehicle Emission Factor (kg CO2/km) = Total CO2 (kg)`
+
+### 📝 PostgreSQL Implementation: Dynamic Emission Views
+
+We create a virtual table (a View) that automatically joins the `trips` data with the specific `vehicles` data to calculate the exact carbon footprint of every single trip the moment it is queried.
+
+#### 1. The Individual Trip Emissions View
+This view calculates the CO2 for each specific delivery or journey.
+
+```sql
+CREATE OR REPLACE VIEW trip_emissions AS
+SELECT 
+    t.id AS trip_id,
+    t.trip_date,
+    t.distance_km,
+    v.license_plate,
+    v.emission_factor,
+    p.full_name AS driver_name,
+    p.company_id,
+    -- The Core Calculation Engine
+    (t.distance_km * v.emission_factor) AS total_co2_kg
+FROM 
+    public.trips t
+JOIN 
+    public.vehicles v ON t.vehicle_id = v.id
+JOIN 
+    public.profiles p ON t.driver_id = p.id;
+```
+
+#### 2. The Fleet-Wide Aggregation View
+Managers do not just want to see individual trips; they need to see the total carbon footprint of their entire fleet over time. We create a second view that aggregates the data from the first view, grouping it by company.
+
+```sql
+CREATE OR REPLACE VIEW company_emission_summary AS
+SELECT 
+    company_id,
+    DATE_TRUNC('month', trip_date) AS emission_month,
+    SUM(distance_km) AS total_fleet_distance_km,
+    SUM(total_co2_kg) AS total_fleet_co2_kg
+FROM 
+    trip_emissions
+GROUP BY 
+    company_id, 
+    DATE_TRUNC('month', trip_date)
+ORDER BY 
+    emission_month DESC;
+```
+
+Applying Security to Views
+
+Because PostgreSQL Views bypass Row Level Security by default if not configured correctly, we must ensure these views are queried with the authenticated user's permissions. By structuring the queries through Supabase's authenticated API, the RLS policies built in Part 4 cascade down into these views. A manager querying the company_emission_summary will only receive the aggregated math for their specific company_id.
+
+The database is now fully optimized to handle thousands of driver logs and instantly return calculated carbon reports.
