@@ -168,6 +168,102 @@ CREATE TRIGGER on_auth_user_created
     FOR EACH ROW EXECUTE PROCEDURE public.handle_new_user();
 ```
 
-Architectural Advantages
 By using a SECURITY DEFINER trigger, the backend handles the heavy lifting safely. The frontend never has to be trusted with manually writing to the profiles table or assigning its own role. It simply passes the user's name and the optional company code during the initial email and password signup, and the PostgreSQL server orchestrates the rest securely.
 With users now authenticated and locked into their respective roles and companies, the platform must enforce strict data isolation.
+
+
+## 🛡️ Part 4: Row Level Security (RLS) Implementation Guide
+
+### The Multi-Tenant Data Isolation Problem
+In a SaaS architecture where multiple companies share the same database tables, absolute data isolation is critical. A manager from "Company A" must never be able to query the vehicles, drivers, or CO2 emissions of "Company B." Furthermore, a driver should only be able to log trips for themselves, not on behalf of other drivers.
+
+Instead of writing complex authorization logic in the Flutter frontend or relying on edge functions to filter data, EcoLogistics enforces isolation at the lowest possible level: the database rows. 
+
+### Enabling RLS and Defining Policies
+By enabling Row Level Security (RLS) in PostgreSQL, every single query—whether from a mobile app, a web dashboard, or an API call—must pass a strict policy check before the database returns any data.
+
+#### 1. Securing the Profiles Table
+First, we enable RLS on the `profiles` table. The policy ensures that a user can only read profiles that belong to their specific `company_id`.
+
+```sql
+-- Enable RLS on the table
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+
+-- Policy: Users can only see profiles within their own company
+CREATE POLICY "Users can view company profiles" 
+ON public.profiles 
+FOR SELECT 
+USING (
+    company_id = (
+        SELECT company_id FROM public.profiles WHERE id = auth.uid()
+    )
+);
+
+-- Policy: Users can only update their own specific profile
+CREATE POLICY "Users can update own profile" 
+ON public.profiles 
+FOR UPDATE 
+USING (id = auth.uid());## 🛡️ Part 4: Row Level Security (RLS) Implementation Guide
+```
+
+#### 2. Locking Down the Vehicles
+Managers need the ability to add, update, and delete vehicles for their fleet. Drivers only need to view the vehicles to select them when logging a trip.
+
+```sql
+ALTER TABLE public.vehicles ENABLE ROW LEVEL SECURITY;
+
+-- Policy: Everyone in the company can view the company vehicles
+CREATE POLICY "Company members can view vehicles" 
+ON public.vehicles 
+FOR SELECT 
+USING (
+    company_id = (
+        SELECT company_id FROM public.profiles WHERE id = auth.uid()
+    )
+);
+
+-- Policy: Only managers can insert or modify vehicles
+CREATE POLICY "Managers can manage vehicles" 
+ON public.vehicles 
+FOR ALL 
+USING (
+    'manager' = (
+        SELECT role FROM public.profiles WHERE id = auth.uid()
+    )
+    AND
+    company_id = (
+        SELECT company_id FROM public.profiles WHERE id = auth.uid()
+    )
+);
+```
+
+#### 3. Securing the Trip Logs (The Transactional Data)
+This is the most critical security layer. Drivers must be able to insert trips, but they should only be able to insert trips tied to their own driver_id. Managers need to read all trips for the company to calculate CO2.
+
+```sql
+ALTER TABLE public.trips ENABLE ROW LEVEL SECURITY;
+
+-- Policy: Drivers can insert their own trips
+CREATE POLICY "Drivers can insert own trips" 
+ON public.trips 
+FOR INSERT 
+WITH CHECK (
+    driver_id = auth.uid()
+);
+
+-- Policy: Managers can view all trips for their company's drivers
+CREATE POLICY "Managers can view company trips" 
+ON public.trips 
+FOR SELECT 
+USING (
+    driver_id IN (
+        SELECT id FROM public.profiles WHERE company_id = (
+            SELECT company_id FROM public.profiles WHERE id = auth.uid()
+        )
+    )
+);
+```
+The Architectural Result
+
+With these policies active, the Flutter frontend becomes completely "dumb" regarding security. If a malicious user intercepts the API and tries to run SELECT * FROM vehicles, the PostgreSQL server will automatically restrict the response to only the vehicles matching their authenticated company_id.
+
